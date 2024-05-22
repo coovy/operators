@@ -1,0 +1,9 @@
+[submodule "pytorch"]
+	path = pytorch
+	url = git@github.com:pytorch/pytorch.git
+[submodule "tensorflow"]
+	path = tensorflow
+	url = git@github.com:tensorflow/tensorflow.git
+[submodule "onnx"]
+	path = onnx
+	url = git@github.com:onnx/onnx.git
