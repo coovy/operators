@@ -147,6 +147,7 @@ struct QueueRecord {
 然后还提供了另外一种实现:
 使用了vector数组dealloc_task，它的索引是内存块的id, value是使用当前内存块的tensor的last_task,
 所以它的实现过程也是遍历所有tensor，更新存储分配结果的assignment, 使用了vector数组dealloc_task这些。
+end-----这样就是从时序的角度去分配
 ```
 template <typename TensorSizeT>
 absl::Status EqualityAssignmentWithHash(
@@ -198,6 +199,117 @@ https://blog.csdn.net/jinzhuojun/article/details/128979978?spm=1001.2014.3001.55
 这两篇论文:
 Efficient Memory Management for Deep Neural Net Inference
 On-Device Neural Net Inference with Mobile GPUs
-还是详细再总结一下:
+
+然后是看`greedy_by_breadth_assignment.cc`的实现，这个是比较巧妙的一种思路
+总体思路: 每个task运行时间，此时肯定存在一些中间张量，所以用一个task_profiles记录每个task运行时会存在的所有中间张量，task_profiles的结构就是二维vector
+然后task_breadth存储每个task，和对应的所有中间张量的size之和，按照size从大到小排序，
+然后obj_schedules存储着所有已经分配的共享对象(buffer)，和每个共享对象现在已经分配的tensor，所以obj_schedules是一个vector,元素是共享同一个buffer的tensor集合
+然后就是遍历task_breadth，从拥有最大中间张量size的task开始，再遍历它的中间张量，去和obj_schedules中的buffer和对应的tensor对比，选取可以使用的buffer，
+如果有多个可以使用就用当前tensor的size和buffer的size差别最合适的,没有就新建buffer。
+end------这样就是从空间的角度去贪心分配
+```
+
+// 传入一个包含所有tensor使用记录的vector: usage_records
+absl::Status GreedyByBreadthAssignment(
+    const std::vector<TensorUsageRecord<size_t>>& usage_records,
+    ObjectsAssignment<size_t>* assignment) {
+  std::vector<TaskProfile> task_profiles = CalculateTaskProfiles(usage_records);
+  // task_profile是一个vector，下标代表task_id, 每个元素是一个vector，包含了task_id对应的所有tensor使用记录, 所以task_profile的含义是存储相应task_id执行时所有的tensor
+
+  // Task breadth is a sum of sizes of all tensors in its TaskProfile
+  std::vector<TaskBreadthWithId> task_breadth;  // task_breadth代表每个task的宽度
+  for (size_t task_id = 0; task_id < task_profiles.size(); ++task_id) {
+    size_t breadth = 0;
+    for (const auto& tensor_info : task_profiles[task_id]) {
+      breadth += tensor_info.usage_record->tensor_size;
+    }
+    task_breadth.emplace_back(breadth, task_id);
+  }
+
+  assignment->object_sizes.clear();
+  assignment->object_ids.assign(usage_records.size(), kNotAssigned);
+  std::vector<SharedObjectSchedule> obj_schedules;    // Set of usage records for all tensors assigned to the shared object, ordered by first_task.
+
+  // Iterate through all tasks in non-increasing order of their breadth.
+  std::stable_sort(task_breadth.rbegin(), task_breadth.rend());
+  for (const auto& task : task_breadth) {
+    // Iterate through all tensors, that must be allocated during the execution
+    // of task, in non-increasing order of their tensor_size.
+    for (const auto& tensor_info : task_profiles[task.task_id]) {
+      // 遍历思路：从宽度最大的task开始 -> 找到task_profiles的所有中间张量， 然后从宽度最小的tensor开始，tensor_info就是一个vector<TensorUsageWithIndex>
+      if (assignment->object_ids[tensor_info.idx] != kNotAssigned) {
+        // 如果当前tensor已经被分配了，那么就跳过
+        continue;
+      }
+      const auto& rec = *tensor_info.usage_record; // rec是一个TensorUsageRecord结构体，现在要为rec分配object
+      const size_t num_objects = obj_schedules.size();  // obj_schedules是一个vector，每个元素是一个set, 代表一个object的所有tensor使用记录, 按照first排序
+      size_t best_object = num_objects;
+      for (size_t obj_id = 0; obj_id < num_objects; ++obj_id) {
+        // 为这个TensorUsageRecord找到一个最合适的object，可能有多个object合适，哪个最合适？遍历所有object，某个可用的object且这个object的tensor_size和rec的tensor_size最接近
+        // If size of current_object is worse than size of best found before, we
+        // can skip it.
+        if (best_object != num_objects) {
+          const size_t best_size = assignment->object_sizes[best_object];
+          const size_t cur_size = assignment->object_sizes[obj_id];
+          if (best_size < rec.tensor_size) {
+            if (cur_size <= best_size) {
+              // best_size is smaller than tensor_size, but cur_size is even
+              // smaller.
+              continue;
+            }
+          } else if (cur_size < rec.tensor_size || cur_size >= best_size) {
+            // best_size is larger or equal to tensor_size, and cur_size is
+            // either smaller than tensor_size, or too large.
+            continue;
+          }
+        }
+        const auto& schedule = obj_schedules[obj_id]; // schedule是一个set，存储了obj_id这个object的所有tensor使用记录
+        auto it = schedule.lower_bound(rec); // 返回第一个first大于等于rec的first的元素
+        bool update_best_object = true;
+        if (it != schedule.end() && it->first_task <= rec.last_task) {
+          // 如果找到了一个first大于等于rec的first的元素，且这个元素的first_task小于等于rec的last_task，那就说明这两个tensor的使用时间有重叠，不能复用同一个object
+          // Some tensor, which usage interval intersects with current, already
+          // assigned to this object.
+          update_best_object = false;
+        }
+        if (update_best_object && it != schedule.begin()) {
+          it--;
+          if (it->last_task >= rec.first_task) {
+            // 说明和前一个tensor的使用时间有重叠，不能复用同一个object
+            // Some tensor, which usage interval intersects with current,
+            // already assigned to this object.
+            update_best_object = false;
+          }
+        }
+        if (update_best_object) {
+          // 说明和前后的tensor都没有重叠，可以复用同一个object
+          best_object = obj_id;
+        }
+      }
+      if (best_object == num_objects) {
+        // Create new shared object and assign current tensor to it.
+        obj_schedules.push_back({rec});
+        assignment->object_sizes.push_back(rec.tensor_size);
+      } else {
+        // Assign current tensor to best_object.
+        obj_schedules[best_object].insert(rec);
+        // Size of best_object can be increased, if it is smaller than
+        // tensor_size.
+        assignment->object_sizes[best_object] =
+            std::max(assignment->object_sizes[best_object], rec.tensor_size);
+      }
+      assignment->object_ids[tensor_info.idx] = best_object;
+    }
+  }
+  // In the end all tensors must be assigned to some objects.
+  for (const auto& obj_id : assignment->object_ids) {
+    if (obj_id == kNotAssigned) {
+      return absl::InternalError("Error while calculating the assignment.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+```
 
 
