@@ -846,4 +846,1202 @@ inline void setTensorElementType(int32_t elem_type, TypeProto::ValueCase value_c
 }
 ```
 
+onnx形状推导:
+
+在onnx中定义有一个枚举, 表示某个维度的值是一个value，还是一个参数，还是未设置:
+```
+  enum ValueCase {
+    kDimValue = 1,
+    kDimParam = 2,
+    VALUE_NOT_SET = 0,
+  };
+```
+[implementation.h](onnx/onnx/shape_inference)
+```
+// 用来存储模型中定义的局部函数
+using ModelLocalFunctionsMap = std::unordered_map<std::string, const FunctionProto*>;
+
+// 用来存储已知的静态变量的值
+using DataValueMap = std::unordered_map<std::string, TensorShapeProto>;
+
+// 使用一个std::unordered_set<std::string> existing_symbols;存储所有参数化的维度
+class SymbolTableImpl : public SymbolTable {
+ public:
+  SymbolTableImpl() : index_(0) {}
+
+  void addFromGraph(const GraphProto& g) override {
+    // 返回类型都是ValueInfoProto: 描述张量的元数据和类型信息(name, type, shape)
+    AddExistingSymbolicDims(g.input());
+    AddExistingSymbolicDims(g.output());
+    AddExistingSymbolicDims(g.value_info());
+  }
+  // Creates a new unique symbol with the given prefix and adds it to the SymbolTable
+  // Returns the newly created symbol
+  std::string createNew(const std::string& symbol_prefix) override {
+    std::string newSymbol;
+    do {
+      newSymbol = symbol_prefix + std::to_string(index_++);
+    } while (existing_symbols.count(newSymbol) > 0);
+    existing_symbols.insert(newSymbol);
+    return newSymbol;
+  }
+
+ private:
+  unsigned int index_;
+  std::unordered_set<std::string> existing_symbols;
+
+  // TypeProto_Tensor or TypeProto_SparseTensor
+  template <typename TensorTypeProto>
+  void AddExistingSymbolicDims(const TensorTypeProto& tensorType) {
+    if (tensorType.has_shape()) {
+      for (int i = 0; i < tensorType.shape().dim_size(); ++i) {
+        if (tensorType.shape().dim(i).has_dim_param()) {
+          existing_symbols.insert(tensorType.shape().dim(i).dim_param());
+        }
+      }
+    }
+  }
+
+  void AddExistingSymbolicDims(const TypeProto& typeProto) {
+    const auto val_case = typeProto.value_case();
+    switch (val_case) {
+      case TypeProto::kTensorType:
+        AddExistingSymbolicDims(typeProto.tensor_type());
+        break;
+      case TypeProto::kSparseTensorType:
+        AddExistingSymbolicDims(typeProto.sparse_tensor_type());
+        break;
+      case TypeProto::kSequenceType:
+        AddExistingSymbolicDims(typeProto.sequence_type().elem_type());
+        break;
+      case TypeProto::kOptionalType:
+        AddExistingSymbolicDims(typeProto.optional_type().elem_type());
+        break;
+      case TypeProto::kMapType:
+        AddExistingSymbolicDims(typeProto.map_type().value_type());
+        break;
+      default:
+        break;
+    }
+  }
+
+  void AddExistingSymbolicDims(const google::protobuf::RepeatedPtrField<ValueInfoProto>& protos) {
+    for (const auto& proto : protos) {
+      AddExistingSymbolicDims(proto.type());
+    }
+  }
+};
+
+
+// 存储推导上下文信息，
+struct GraphInferenceContext {
+  GraphInferenceContext(
+      // key: 张量名称， value：外部作用域中值的类型信息
+      const std::unordered_map<std::string, TypeProto*>& outer_scope_value_types_by_name_in,
+      // 操作集（opset）导入映射，记录了不同域（domain）和版本的对应关系
+      const std::unordered_map<std::string, int> opset_imports_in,
+      // 符号表
+      SymbolTable* symbol_table_in = nullptr,
+      // 局部函数unordered_map
+      const ModelLocalFunctionsMap& model_local_functions_in = {},
+      // 存储opschema的注册表，用于查找和验证opschema
+      const ISchemaRegistry* schema_registry_in = OpSchemaRegistry::Instance(),
+      DataValueMap* generated_shape_data_by_name_in = nullptr,
+      const int ir_version_in = IR_VERSION)
+      : outer_scope_value_types_by_name{&outer_scope_value_types_by_name_in},
+        opset_imports{opset_imports_in},
+        symbol_table{symbol_table_in},
+        model_local_functions{model_local_functions_in},
+        schema_registry{schema_registry_in},
+        generated_shape_data_by_name{generated_shape_data_by_name_in},
+        ir_version{ir_version_in} {}
+
+  const std::unordered_map<std::string, TypeProto*>* outer_scope_value_types_by_name;
+  const std::unordered_map<std::string, int> opset_imports;
+  SymbolTable* symbol_table;
+  const ModelLocalFunctionsMap& model_local_functions;
+  const ISchemaRegistry* schema_registry;
+  DataValueMap* generated_shape_data_by_name;
+  const int ir_version;
+};
+```
+
+
+```
+onnx中的域常量定义
+// ONNX domains.
+constexpr const char* AI_ONNX_ML_DOMAIN = "ai.onnx.ml";
+constexpr const char* AI_ONNX_TRAINING_DOMAIN = "ai.onnx.training";
+constexpr const char* AI_ONNX_PREVIEW_TRAINING_DOMAIN = "ai.onnx.preview.training";
+// The following two are equivalent in an onnx proto representation.
+constexpr const char* ONNX_DOMAIN = "";
+constexpr const char* AI_ONNX_DOMAIN = "ai.onnx";
+
+// onnx中的一行代码: using OperatorSetVersion = int;
+// 一个unordered_map映射<算子名称, <域名称, <算子版本号, Opschema>>>
+// Map type to store operator schemas. The format is,
+// <OpName, <Domain, <OperatorSetVersion, OpSchema>>>.
+using OpName_Domain_Version_Schema_Map =
+    std::unordered_map<std::string, std::unordered_map<std::string, std::map<OperatorSetVersion, OpSchema>>>;
+```
+
+```
+class ISchemaRegistry {
+ public:
+  virtual ~ISchemaRegistry() = default;
+
+  virtual const OpSchema*
+  GetSchema(const std::string& key, const int maxInclusiveVersion, const std::string& domain = ONNX_DOMAIN) const = 0;
+};
+
+
+class OpSchemaRegistry final : public ISchemaRegistry {
+ public:
+
+  // 存储onnx中各个域的op_set的版本信息
+  // A singleton class to store domain to min/max op_set version map, as well as
+  // domain to last-release op_set version map.
+  class DomainToVersionRange final {
+   public:
+    DomainToVersionRange() {
+    }
+    ......
+    ......
+  }
+  // 就是获取一个全局的OpName_Domain_Version_Schema_Map，将相应版本的opschema写入这个映射
+  class OpSchemaRegisterOnce final {
+   public:
+    // Export to cpp custom register macro
+    OpSchemaRegisterOnce(OpSchema op_schema, int opset_version_to_load = 0, bool fail_duplicate_schema = true) {
+      OpSchemaRegisterNoExcept(std::move(op_schema), opset_version_to_load, fail_duplicate_schema);
+    }
+    static void
+    OpSchemaRegisterNoExcept(OpSchema&& op_schema, int opset_version_to_load = 0, bool fail_duplicate_schema = true) {
+      ONNX_TRY {
+        OpSchemaRegisterImpl(std::move(op_schema), opset_version_to_load, fail_duplicate_schema);
+      }
+      ONNX_CATCH(const std::exception& e) {
+        ONNX_HANDLE_EXCEPTION([&]() { std::cerr << "Schema error: " << e.what() << std::endl; });
+      }
+    }
+    static void
+    OpSchemaRegisterImpl(OpSchema&& op_schema, int opset_version_to_load = 0, bool fail_duplicate_schema = true) {
+      op_schema.Finalize();
+      // 获取一个全局的静态映射表m，用于存储所有操作符的schema信息
+      auto& m = GetMapWithoutEnsuringRegistration();
+      auto& op_name = op_schema.Name();
+      auto& op_domain = op_schema.domain();
+      auto& schema_ver_map = m[op_name][op_domain];
+      auto ver = op_schema.SinceVersion();
+      if (OpSchema::kUninitializedSinceVersion == ver) {
+        op_schema.SinceVersion(1);
+        ver = op_schema.SinceVersion();
+      }
+
+      // Stops because the exact opset_version is registered
+      if (schema_ver_map.count(ver)) {
+        if (fail_duplicate_schema) {
+          const auto& schema = schema_ver_map[ver];
+          std::stringstream err;
+          err << "Trying to register schema with name " << op_name << " (domain: " << op_domain << " version: " << ver
+              << ") from file " << op_schema.file() << " line " << op_schema.line()
+              << ", but it is already registered from file " << schema.file() << " line " << schema.line() << std::endl;
+          fail_schema(err.str());
+        }
+        return;
+      }
+
+      if (opset_version_to_load != 0) {
+        // Stops because the opset_version is higher than opset_version_to_load
+        // 确保注册的版本号小于目标版本号，为了兼容性
+        if (ver > opset_version_to_load) {
+          return;
+        }
+
+        // 确保在目标操作集版本范围内没有比当前要注册的操作符版本更高的版本。有就停止
+        // Stops because a later version is registered within target opset version
+        if (!schema_ver_map.empty()) {
+          int max_registered_ver_le_target = GetMaxRegisteredVerWithinTarget(schema_ver_map, opset_version_to_load);
+          if (max_registered_ver_le_target >= ver) {
+            return;
+          }
+        }
+      }
+
+      CheckDomainAndVersionToRegister(op_schema, op_name, op_domain);
+      schema_ver_map.insert(std::pair<int, OpSchema&&>(ver, std::move(op_schema)));
+    }
+
+   private:
+    // Gets the maximum version from given map that is less or equal to target version
+    static int GetMaxRegisteredVerWithinTarget(const std::map<OperatorSetVersion, OpSchema>& m, int target_ver) {
+      // std::map is sorted on key
+      // reverse iterator returns the largest element keyed on the integer version
+      for (auto&& it = m.rbegin(); it != m.rend(); it++) {
+        const auto& registered_ver = it->first;
+        if (registered_ver <= target_ver) {
+          return registered_ver;
+        }
+      }
+      return -1;
+    }
+
+    static void CheckDomainAndVersionToRegister(
+        const OpSchema& op_schema,
+        const std::string& op_name,
+        const std::string& op_domain) {
+      auto ver_range_map = DomainToVersionRange::Instance().Map();
+      auto ver_range_it = ver_range_map.find(op_domain);
+      auto ver = op_schema.SinceVersion();
+
+      if (ver_range_it == ver_range_map.end()) {
+        std::stringstream err;
+        err << "Trying to register schema with name " << op_name << " (domain: " << op_domain << " version: " << ver
+            << ") from file " << op_schema.file() << " line " << op_schema.line() << ", but its domain is not"
+            << " known by the checker." << std::endl;
+
+        fail_schema(err.str());
+      }
+      auto lower_bound_incl = ver_range_it->second.first;
+      auto upper_bound_incl = ver_range_it->second.second;
+      if (!(lower_bound_incl <= ver && upper_bound_incl >= ver)) {
+        std::stringstream err;
+        err << "Trying to register schema with name " << op_name << " (domain: " << op_domain << " version: " << ver
+            << ") from file " << op_schema.file() << " line " << op_schema.line() << ", but its version is not "
+            << "in the inclusive range [" << lower_bound_incl << ", " << upper_bound_incl
+            << "] (usually, this means you "
+            << "bumped the operator version but "
+            << "forgot to update the version range in DomainToVersionRange "
+            << "in onnx/defs/schema.h)." << std::endl;
+        fail_schema(err.str());
+      }
+    }
+  };
+  // 简单地从这个unordered_map映射中删除这个opschema
+  OpSchemaDeregister(const std::string& op_type, const int version, const std::string& domain = ONNX_DOMAIN) {.....}
+  static void OpSchemaDeregisterAll(const std::string& domain = ONNX_DOMAIN) {......}
+  // 返回对应的最新版本地schema
+  // Return the latest schema for an operator in specified domain.
+  // Domain with default value ONNX_DOMAIN means ONNX.
+  static const OpSchema* Schema(const std::string& key, const std::string& domain = ONNX_DOMAIN) {}
+}
+ // 成员变量
+ private:
+  // OpSchemaRegistry should not need to be instantiated except statically
+  // within this class
+  // 默认构造私有，单例模式
+  OpSchemaRegistry() = default;
+
+  /**
+   * @brief Returns the underlying string to OpSchema map.
+   *
+   * You should not manually manipulate the map object returned. Instead, use
+   * the macros defined such as ONNX_OPERATOR_SET_SCHEMA to register your
+   * operator schema.
+   *
+   * We wrap it inside a function to avoid the static initialization order
+   * fiasco.
+   */
+  // 里面就两行代码  static OpName_Domain_Version_Schema_Map map;
+  // return map;
+  static OpName_Domain_Version_Schema_Map& GetMapWithoutEnsuringRegistration();
+  // 内部调用GetMapWithoutEnsuringRegistration()初始化一个静态OpName_Domain_Version_Schema_Map， 然后注册所有opschema
+  static OpName_Domain_Version_Schema_Map& map();
+  static int loaded_schema_version;
+```
+
+
+
+```
+// 形状推导选项
+struct ShapeInferenceOptions {
+  // Checks the type-equality for input and output
+  bool check_type;
+  // 1: Will throw any node level shape infer errors
+  // 0: Won't throw node-level shape infer errors, but other errors
+  // like merging existing shape with inferred etc are thrown
+  int error_mode;
+  // Enables data propagation for limited operators
+  // to perform shape computation
+  bool enable_data_propagation;
+  ShapeInferenceOptions(bool check_type_val = false, int strict_mode_val = 0, bool data_prop_val = false)
+      : check_type(check_type_val), error_mode(strict_mode_val), enable_data_propagation(data_prop_val){};
+};
+
+// 维护一个符号表，用于形状推断
+// Maintains a SymbolTable for symbolic shape inference
+class SymbolTable {
+ public:
+  // Adds existing symbols from a main graph or subgraph
+  virtual void addFromGraph(const GraphProto& g) = 0;
+  // Creates a new symbol which is not duplicate as any existing one
+  std::string createNew() {
+    return createNew("unk__");
+  }
+  virtual std::string createNew(const std::string& symbol_prefix) = 0;
+  virtual ~SymbolTable() = default;
+};
+
+// 在图上执行推理的抽象基类
+class GraphInferencer {
+ public:
+  // Perform inferencing on the graph contained in GraphInferencer.
+  // Returns the graph output types post-inferencing.
+  virtual std::vector<const TypeProto*> doInferencing(
+      const std::vector<const TypeProto*>& inputTypes,
+      const std::vector<const TensorProto*>& inputData) = 0;
+  virtual ~GraphInferencer() = default;
+};
+
+class GraphInferencerImpl : public GraphInferencer {
+ public:
+  GraphInferencerImpl(GraphProto& g, GraphInferenceContext& context) : g_{&g}, context_{&context}, options_() {}
+  GraphInferencerImpl(GraphProto& g, GraphInferenceContext& context, const ShapeInferenceOptions& options)
+      : g_{&g}, context_{&context}, options_(options) {}
+
+  std::vector<const TypeProto*> doInferencing(
+      const std::vector<const TypeProto*>& inputTypes,
+      const std::vector<const TensorProto*>& inputData) override;
+
+ private:
+  GraphProto* g_;
+  GraphInferenceContext* context_;
+  ShapeInferenceOptions options_;
+};
+
+
+// 推理上下文实现
+struct InferenceContextImpl : public InferenceContext {
+  InferenceContextImpl(
+      NodeProto& n,
+      const std::unordered_map<std::string, TypeProto*>& valueTypesByName,
+      const std::unordered_map<std::string, const TensorProto*>& inputDataByName,
+      const std::unordered_map<std::string, const SparseTensorProto*>& inputSparseDataByName,
+      const ShapeInferenceOptions& options,
+      DataValueMap* generatedShapeData = nullptr,
+      GraphInferenceContext* graphInferenceContext = nullptr)
+      : graphInferenceContext_{graphInferenceContext}, options_(options), node_(&n) {
+    // 获取所有属性存入attributesByName_
+    for (auto& attr : *n.mutable_attribute()) {
+      attributesByName_[attr.name()] = &attr;
+      if (attr.has_g()) {
+        // need a mutable GraphProto to run inferencing on this attribute
+        graphProtoAttributesByName_[attr.name()] = attr.mutable_g();
+      }
+    }
+
+    for (const auto& input : n.input()) {
+      auto valueTypesIter = valueTypesByName.find(input);
+      if (valueTypesIter != valueTypesByName.end()) {
+        // 记录所有输入值的类型，放入vector
+        allInputTypes_.push_back
+        (valueTypesIter->second);
+      } else {
+        allInputTypes_.push_back(nullptr);
+      }
+
+      // input data can be in 1 of the 3 containers
+      // inputDataByName - this is when input is TensorProto
+      // inputSparseDataByName - this is when input is SparseTensorProto
+      // generatedShapeData - this is when input was generated as part of partial data propagation
+      // 判断输入数据是普通张量还是稀疏矩阵还是推理过程产生的形状数据，分别存在三个vector
+      const auto inputDataIter = inputDataByName.find(input);
+
+      if (inputDataIter != inputDataByName.cend()) {
+        allInputData_.push_back(inputDataIter->second);
+        allInputSparseData_.push_back(nullptr);
+        allShapeInputData_.push_back(nullptr);
+      } else {
+        allInputData_.push_back(nullptr);
+        const auto inputSparseDataIter = inputSparseDataByName.find(input);
+        if (inputSparseDataIter != inputSparseDataByName.cend()) {
+          allInputSparseData_.push_back(inputSparseDataIter->second);
+          allShapeInputData_.push_back(nullptr);
+        } else {
+          allInputSparseData_.push_back(nullptr);
+          if (generatedShapeData != nullptr) {
+            const auto inputShapeDataIter = generatedShapeData->find(input);
+            if (inputShapeDataIter != generatedShapeData->cend()) {
+              allShapeInputData_.push_back(&inputShapeDataIter->second);
+            } else {
+              allShapeInputData_.push_back(nullptr);
+            }
+          } else {
+            allShapeInputData_.push_back(nullptr);
+          }
+        }
+      }
+    }
+    // 将输出vector的size大小改变
+    allOutputTypes_.resize(n.output_size());
+  }
+
+  // 以下是获取各种存储好的数据
+  const AttributeProto* getAttribute(const std::string& name) const override {
+    ......
+  }
+
+  size_t getNumInputs() const override {
+    return allInputTypes_.size();
+  }
+
+  const TypeProto* getInputType(size_t index) const override {
+    ......
+  }
+
+  const TensorProto* getInputData(size_t index) const override {
+    ......
+  }
+
+  const TensorShapeProto* getSymbolicInput(size_t index) const override {
+    ......
+  }
+
+  const SparseTensorProto* getInputSparseData(size_t index) const override {
+    ......
+  }
+
+  size_t getNumOutputs() const override {
+    return allOutputTypes_.size();
+  }
+
+  TypeProto* getOutputType(size_t index) override {
+    ......
+  }
+
+  // 获取子图的GraphInferencer实例
+  GraphInferencer* getGraphAttributeInferencer(const std::string& attr_name) override {
+    if (!graphInferenceContext_) {
+      fail_type_inference("GraphProto attribute inferencing is not enabled in this InferenceContextImpl instance.");
+    }
+
+    GraphInferencer* inferencer = nullptr;
+
+    auto entry = graphAttributeInferencers_.find(attr_name);
+    if (entry == graphAttributeInferencers_.cend()) {
+      // create GraphInferencer instance
+      auto attrNameToGraphProto = graphProtoAttributesByName_.find(attr_name);
+      if (attrNameToGraphProto == graphProtoAttributesByName_.cend()) {
+        fail_type_inference("Attribute ", attr_name, " does not contain a graph.");
+      }
+
+      std::unique_ptr<GraphInferencer> new_inferencer{
+          new GraphInferencerImpl(*attrNameToGraphProto->second, *graphInferenceContext_, options_)};
+
+      inferencer = new_inferencer.get();
+      graphAttributeInferencers_.emplace(attr_name, std::move(new_inferencer));
+    } else {
+      inferencer = entry->second.get();
+    }
+
+    return inferencer;
+  }
+
+  std::string getDisplayName() const override {
+    if (node_ == nullptr)
+      return "";
+    if (node_->domain().empty()) {
+      if (node_->name().empty())
+        return MakeString("node ", node_->op_type());
+      return MakeString("node ", node_->op_type(), " (", node_->name(), ")");
+    }
+    if (node_->name().empty())
+      return MakeString("node ", node_->op_type(), "[", node_->domain(), "]");
+    return MakeString("node ", node_->op_type(), "[", node_->domain(), "]", " (", node_->name(), ")");
+  }
+
+  std::vector<const TensorProto*> allInputData_;
+  std::vector<const SparseTensorProto*> allInputSparseData_;
+  std::vector<const TensorShapeProto*> allShapeInputData_;
+  std::unordered_map<std::string, const AttributeProto*> attributesByName_;
+  std::unordered_map<std::string, GraphProto*> graphProtoAttributesByName_;
+  std::vector<const TypeProto*> allInputTypes_;
+  std::vector<TypeProto> allOutputTypes_;
+  GraphInferenceContext* graphInferenceContext_;
+
+  // mutable as internal cache of GraphInferencer instances
+  mutable std::unordered_map<std::string, std::unique_ptr<GraphInferencer>> graphAttributeInferencers_;
+  ShapeInferenceOptions options_;
+  NodeProto* node_;
+};
+
+
+// 和上面的形状传播上下文类似
+struct DataPropagationContextImpl : public DataPropagationContext {
+  DataPropagationContextImpl(
+      NodeProto& n,
+      const std::unordered_map<std::string, TypeProto*>& valueTypesByName,
+      const std::unordered_map<std::string, const TensorProto*>& inputDataByName,
+      DataValueMap& generatedShapeData)
+      : generatedShapeData_(generatedShapeData) {
+    size_t input_idx = 0;
+
+    for (auto& attr : *n.mutable_attribute()) {
+      // 记录所有属性
+      attributesByName_[attr.name()] = &attr;
+    }
+
+    for (const auto& input : n.input()) {
+       // 将所有输入索引和输入进行映射
+      inputIndexToNameMap_.insert({input_idx++, input});
+
+      // 存储所有输入类型
+      auto valueTypesIter = valueTypesByName.find(input);
+      if (valueTypesIter != valueTypesByName.end()) {
+        allInputTypes_.push_back(valueTypesIter->second);
+      } else {
+        allInputTypes_.push_back(nullptr);
+      }
+
+      // 存储所有输入数据
+      const auto inputDataIter = inputDataByName.find(input);
+      if (inputDataIter != inputDataByName.cend()) {
+        allInputData_.push_back(inputDataIter->second);
+      } else {
+        allInputData_.push_back(nullptr);
+      }
+    }
+
+    size_t output_idx = 0;
+    for (const auto& output : n.output()) {
+      outputIndexToNameMap_.insert({output_idx++, output});
+    }
+
+    allOutputTypes_.resize(n.output_size());
+  }
+
+  const AttributeProto* getAttribute(const std::string& name) const override {
+    auto iter = attributesByName_.find(name);
+    if (iter == attributesByName_.end()) {
+      return nullptr;
+    } else {
+      return iter->second;
+    }
+  }
+
+  size_t getNumInputs() const override {
+    return allInputTypes_.size();
+  }
+
+  const TypeProto* getInputType(size_t index) const override {
+    if (index >= allInputTypes_.size()) {
+      ONNX_THROW("Input " + ONNX_NAMESPACE::to_string(index) + " is out of bounds.");
+    }
+    return allInputTypes_[index];
+  }
+
+  size_t getNumOutputs() const override {
+    return allOutputTypes_.size();
+  }
+
+  const TypeProto* getOutputType(size_t index) const override {
+    if (index >= allOutputTypes_.size()) {
+      ONNX_THROW("Output " + ONNX_NAMESPACE::to_string(index) + " is out of bounds.");
+    }
+    return &allOutputTypes_[index];
+  }
+
+  // Convert integer vector into TensorShapeProto
+  template <typename INTEGER>
+  void vectorToTensorShapeProto(const std::vector<INTEGER>& input_vals, TensorShapeProto& converted_tsp) const {
+    for (unsigned int i = 0; i < input_vals.size(); ++i) {
+      converted_tsp.mutable_dim()->Add()->set_dim_value(input_vals[i]);
+    }
+  }
+  // 获取指定索引的输入数据的形状信息
+  const TensorShapeProto* getInputData(size_t index) override {
+    if (index >= allInputData_.size()) {
+      ONNX_THROW("Input " + ONNX_NAMESPACE::to_string(index) + " is out of bounds.");
+    }
+    const std::string input_name = inputIndexToNameMap_.at(index);
+    // Gets it from previous data propagation
+    // 如果在生成的形状数据中有形状信息，直接返回
+    auto iter = generatedShapeData_.find(input_name);
+    if (iter != generatedShapeData_.end()) {
+      return &iter->second;
+    }
+    // Otherwise, gets it from initializer if it exists
+    const auto* input_data = allInputData_[index];
+    // Only scalar (0D tensor) or 1D tensor can be converted for now
+    // TODO: It should support tensors with more dimension on demand
+    // 如果在生成的形状数据中没有形状信息，那么解析输入的数据，获取输入数据的维度信息
+    if (input_data != nullptr && (input_data->dims_size() == 0 || input_data->dims_size() == 1)) {
+      TensorShapeProto tsp;
+
+      if (input_data->data_type() == TensorProto_DataType_INT64) {
+        vectorToTensorShapeProto(ParseData<int64_t>(input_data), tsp);
+      } else if (input_data->data_type() == TensorProto_DataType_INT32) {
+        vectorToTensorShapeProto(ParseData<int32_t>(input_data), tsp);
+      } else {
+        // Only supports integer type to form a shape
+        return nullptr;
+      }
+
+      // Adds this TensorShapeProto from initializer into generatedShapeData
+      // for future use
+      auto result = generatedShapeData_.insert({input_name, std::move(tsp)});
+      if (result.second) {
+        return &(result.first->second);
+      }
+    }
+    return nullptr;
+  }
+
+  // 将输出数据的维度信息存储进generatedShapeData_便于查找
+  void addOutputData(size_t index, TensorShapeProto&& tsp) override {
+    if (index >= outputIndexToNameMap_.size()) {
+      ONNX_THROW("Input " + ONNX_NAMESPACE::to_string(index) + " is out of bounds.");
+    }
+    auto result = generatedShapeData_.insert({outputIndexToNameMap_.at(index), std::move(tsp)});
+    if (!result.second) {
+      fail_shape_inference("Data for input  " + ONNX_NAMESPACE::to_string(index) + " already exists.");
+    }
+  }
+
+  std::vector<const TensorProto*> allInputData_;
+  std::unordered_map<size_t, std::string> inputIndexToNameMap_;
+  std::unordered_map<size_t, std::string> outputIndexToNameMap_;
+  std::vector<const TypeProto*> allInputTypes_;
+  std::vector<TypeProto> allOutputTypes_;
+  DataValueMap& generatedShapeData_;
+  std::unordered_map<std::string, const AttributeProto*> attributesByName_;
+};
+```
+看一看doInferencing这个函数的实现
+```
+
+std::vector<const TypeProto*> GraphInferencerImpl::doInferencing(
+    const std::vector<const TypeProto*>& input_types,
+    const std::vector<const TensorProto*>& input_data) {
+  SymbolTable* symbol_table = context_->symbol_table;
+
+  std::cout<<"正在执行doInferencing: "<<std::endl;
+  int num_inputs = int(input_types.size());
+  std::unordered_set<std::string> initializer_name_set;
+  for (const auto& tp : g_->initializer()) {
+    initializer_name_set.insert(tp.name());
+  }
+
+  if (context_->ir_version >= 4) {
+    if (g_->input_size() != num_inputs) {
+      fail_shape_inference("Graph has ", g_->input_size(), " inputs but ", num_inputs, " were provided");
+    }
+    for (int i = 0; i < g_->input_size(); ++i) {
+      if (initializer_name_set.count(g_->input(i).name()) > 0) {
+        fail_shape_inference(
+            "Cannot use the same name as both a subgraph initializer and subgraph input: ", g_->input(i).name());
+      }
+    }
+  } else {
+    // IR < 4 requires all initializers to be optional inputs
+    // So the number of graph input can be larger than the number of node input
+    if (num_inputs > g_->input_size()) {
+      fail_shape_inference(
+          "Graph has ",
+          g_->input_size(),
+          " inputs but ",
+          num_inputs,
+          " were provided.",
+          "The number of graph input cannot be smaller than the number of node input");
+    } else if (num_inputs < g_->input_size()) {
+      for (int i = 0; i < g_->input_size(); ++i) {
+        if (i < num_inputs && initializer_name_set.count(g_->input(i).name()) > 0) {
+          fail_shape_inference("Graph initializer names must appear after the actual inputs: ", g_->input(i).name());
+        } else if (i >= num_inputs && initializer_name_set.count(g_->input(i).name()) == 0) {
+          // Further check whether the additional input is in initializers
+          fail_shape_inference("Cannot find missing input: ", g_->input(i).name(), "in initializers. ");
+        }
+      }
+    }
+  }
+
+  for (int i = 0, end = num_inputs; i < end; ++i) {
+    const TypeProto* inferred_input = input_types[i];
+
+    if (!inferred_input)
+      continue;
+
+    TypeProto* graph_input = g_->mutable_input(i)->mutable_type();
+    // Even if graphInput doesn't have defined type, it will assign inferredType to it
+    mergeShapesAndTypes(*inferred_input, graph_input);
+
+    if (symbol_table) {
+      MaterializeSymbolicShape(graph_input, *symbol_table);
+    }
+  }
+
+  // future: pass inputData into InferShapes either directly, or indirectly by
+  // updating initializers that match subgraph inputs.
+  (void)input_data;
+  InferShapesImpl(
+      g_,
+      // 指向 std::unordered_map<std::string, TypeProto*> 的指针，这个映射用于存储外部作用域中变量的类型信息。在 ONNX 中，这通常用于子图推断时，从外部作用域（即子图的上层图）获取输入类型
+      *context_->outer_scope_value_types_by_name, // never null
+      context_->opset_imports,
+      options_,
+      symbol_table,
+      context_->model_local_functions,
+      context_->schema_registry,
+      context_->generated_shape_data_by_name);
+
+  std::vector<const TypeProto*> graph_output_types;
+  graph_output_types.reserve(g_->output().size());
+  for (const ValueInfoProto& output : g_->output()) {
+    graph_output_types.push_back(&output.type());
+  }
+
+  return graph_output_types;
+}
+
+// 形状推导实现
+static void InferShapesImpl(
+    GraphProto* g,
+    const std::unordered_map<std::string, TypeProto*>& outer_scope_value_types_by_name,
+    const std::unordered_map<std::string, int>& opset_imports,
+    const ShapeInferenceOptions& options,
+    SymbolTable* symbol_table,
+    const ModelLocalFunctionsMap& model_local_functions_map,
+    const ISchemaRegistry* schema_registry = OpSchemaRegistry::Instance(),
+    DataValueMap* generated_shape_data_by_name = nullptr,
+    const int ir_version = IR_VERSION // default the latest one
+) {
+  DataValueMap empty;
+  if (generated_shape_data_by_name == nullptr) {
+    generated_shape_data_by_name = &empty;
+  }
+  // 实际调用的类
+  ShapeInferenceImplBase base(
+      g,
+      outer_scope_value_types_by_name,
+      opset_imports,
+      options,
+      symbol_table,
+      model_local_functions_map,
+      schema_registry,
+      generated_shape_data_by_name,
+      ir_version);
+  base.Process(*g);
+  base.FinalizeShapeInference();
+
+// 看内部实际调用的类
+class ShapeInferenceImplBase {
+ public:
+  void UpdateType(const std::string& name, TypeProto* inferred_type) {
+    if (inferred_type->value_case() == TypeProto::ValueCase::VALUE_NOT_SET) {
+      return;
+    }
+
+    if (symbol_table) {
+      MaterializeSymbolicShape(inferred_type, *symbol_table);
+    }
+
+    // Find any pre-existing type and shape info. If there is such,
+    // then check for compatibility with the inferred
+    // information. Otherwise, initialize it in an empty state.
+    auto iter = value_types_by_name.find(name);
+    if (iter != value_types_by_name.end()) {
+      mergeShapesAndTypes(*inferred_type, iter->second);
+    } else {
+      value_types_by_name[name] = inferred_types.Add(name, *inferred_type);
+      // For undefined output type, update both value_info and output for now
+      // Update existing output with undefined type: assign inferred type to it
+      iter = undefined_value_types_by_name.find(name);
+      if (iter != undefined_value_types_by_name.end()) {
+        *iter->second = *inferred_type;
+      }
+    }
+  }
+
+  void UpdateType(ValueInfoProto& valueInfo) {
+    if (valueInfo.has_type()) {
+      value_types_by_name[valueInfo.name()] = valueInfo.mutable_type();
+    } else {
+      undefined_value_types_by_name[valueInfo.name()] = valueInfo.mutable_type();
+    }
+  }
+
+  template <typename T>
+  void AddTemporaryConstant(const std::string& name, const T& vector) {
+    input_data_by_name_holder[name] = ToTensor(vector);
+    input_data_by_name[name] = &input_data_by_name_holder[name];
+  }
+
+  void ProcessConstant(const NodeProto& n) {
+    if (IsOnnxDomainOp(n, "Constant") && n.output().size() == 1) {
+      const std::string& output_name = n.output(0);
+      for (const auto& attr : n.attribute()) {
+        if (attr.name() == "value") {
+          if (attr.type() == AttributeProto::TENSOR && attr.has_t()) {
+            if (reuse_constant_tensors) {
+              input_data_by_name[output_name] = &attr.t();
+            } else {
+              input_data_by_name_holder[output_name] = attr.t();
+              input_data_by_name[output_name] = &input_data_by_name_holder[output_name];
+            }
+          } else if (attr.type() == AttributeProto::SPARSE_TENSOR && attr.has_sparse_tensor()) {
+            if (reuse_constant_tensors) {
+              input_sparse_data_by_name[output_name] = &attr.sparse_tensor();
+            }
+          }
+        } else {
+          switch (attr.type()) {
+            case AttributeProto::INTS: {
+              std::vector<int64_t> ints{attr.ints().begin(), attr.ints().end()};
+              AddTemporaryConstant(output_name, ints);
+              break;
+            }
+            case AttributeProto::INT: {
+              std::vector<int64_t> ints({attr.i()});
+              AddTemporaryConstant(output_name, ints);
+              break;
+            }
+            case AttributeProto::FLOATS: {
+              std::vector<float> floats{attr.floats().begin(), attr.floats().end()};
+              AddTemporaryConstant(output_name, floats);
+              break;
+            }
+            case AttributeProto::FLOAT: {
+              std::vector<float> floats({attr.f()});
+              AddTemporaryConstant(output_name, floats);
+              break;
+            }
+            default:
+              break;
+          }
+        }
+      }
+    }
+  }
+
+  void ProcessCall(const NodeProto& caller, const FunctionProto& callee, InferenceContext& ctx) {
+    DataValueMap callee_value_map;
+    if (generated_shape_data_by_name != nullptr) {
+      BindValuesOnCall(*generated_shape_data_by_name, caller, callee_value_map, callee);
+    }
+    InferShapeForFunctionNode(
+        callee, schema_registry, ctx, options, model_local_functions_map, symbol_table, &callee_value_map);
+    if (generated_shape_data_by_name != nullptr) {
+      BindValuesOnReturn(callee_value_map, callee, *generated_shape_data_by_name, caller);
+    }
+  }
+
+  void Process(NodeProto& n) {
+    // Resolve domain for node
+    auto dit = opset_imports.find(n.domain());
+    if (dit == opset_imports.end()) {
+      // Both "" (ONNX_DOMAIN) and "ai.onnx" (AI_ONNX_DOMAIN) refer to the default ONNX domain
+      if (n.domain() == ONNX_DOMAIN) {
+        dit = opset_imports.find(AI_ONNX_DOMAIN);
+      }
+      if (dit == opset_imports.end()) {
+        fail_type_inference(
+            "Cannot infer type and shape for node name ",
+            n.name(),
+            ". No opset import for domain ",
+            n.domain(),
+            " optype ",
+            n.op_type());
+      }
+    }
+    auto domain_version = dit->second;
+    const auto schema = schema_registry->GetSchema(n.op_type(), domain_version, n.domain());
+    InferenceContextImpl ctx(
+        n,
+        value_types_by_name,
+        input_data_by_name,
+        input_sparse_data_by_name,
+        options,
+        generated_shape_data_by_name,
+        &graph_inference_context);
+
+    ONNX_TRY {
+      if (schema) {
+        if (schema->has_type_and_shape_inference_function()) {
+          schema->GetTypeAndShapeInferenceFunction()(ctx);
+        } else if (schema->HasFunction()) {
+          ProcessCall(n, *(schema->GetFunction()), ctx);
+        } // else: rely on schema->CheckInputOutputType() down below.
+        // check type-constraints specified via type variables
+        if (options.check_type) {
+          schema->CheckInputOutputType(ctx);
+        }
+      } else if (model_local_functions_map.size() > 0) {
+        auto iter = model_local_functions_map.find(GetFunctionIdentifier(n));
+        if (iter != model_local_functions_map.end()) {
+          ProcessCall(n, *(iter->second), ctx);
+        } else {
+          has_unsupported_op = true;
+          return;
+        }
+      } else {
+        has_unsupported_op = true;
+        return;
+      }
+      for (int i = 0; i < n.output_size(); ++i) {
+        // skip type and shape propagation for missing optional outputs.
+        if (!n.output(i).empty())
+          UpdateType(n.output(i), ctx.getOutputType(i));
+      }
+      // Constant values are tracked to improve inference/checking for subsequent nodes.
+      ProcessConstant(n);
+      // If data-propagation is enabled, partial-evaluation (aka data-propagation) is performed
+      // to improve inference/checking for subsequent nodes.
+      if (options.enable_data_propagation && schema && schema->has_data_propagation_function()) {
+        if (generated_shape_data_by_name == nullptr) {
+          fail_shape_inference(
+              "Container for generated shape data cannot be nullptr when enable_data_propagation option is set.");
+        }
+        DataPropagationContextImpl data_propagation_ctx(
+            n, value_types_by_name, input_data_by_name, *generated_shape_data_by_name);
+        schema->GetDataPropagationFunction()(data_propagation_ctx);
+      }
+    }
+    ONNX_CATCH(const ONNX_NAMESPACE::InferenceError& ex) {
+      ONNX_HANDLE_EXCEPTION([&]() {
+        // Note: The following special handling is to accommodate custom-ops. Ideally, custom-ops
+        // should be registered with a schema in the schema registry, allowing inference to handle
+        // them. As things stand, this special handling is somewhat fragile and is not fully
+        // general either. Eg., a custom-op suppresses error-messages for subsequent nodes, but
+        // this does not work across graphs. If special handling is required, a user-option may
+        // be a better way to do it. The fragility comes from the fact that the types of the
+        // returned-values of the custom-op are unknown, and subsequent node-level inference
+        // may fail because of this.
+        if (!has_unsupported_op) {
+          inference_errors.push_back(GetErrorWithNodeInfo(n, ex));
+        }
+      });
+    }
+    ONNX_CATCH(const std::runtime_error& err) {
+      // TODO: Fix this. Unclear if this should be remapped to a shape inference error.
+      // Need to rationalize the different types of exceptions that can be thrown.
+      // See: https://github.com/onnx/onnx/pull/5519
+      ONNX_HANDLE_EXCEPTION([&]() { fail_shape_inference(GetErrorWithNodeInfo(n, err)); });
+    }
+  }
+
+  // TypeProto_Tensor or TypeProto_SparseTensor
+  template <typename T>
+  void ProcessInitializer(
+      const std::string& name,
+      const T& tensorValue,
+      TypeProto& initializer_type,
+      std::unordered_map<std::string, const T*>& map) {
+    map[name] = &tensorValue;
+    auto iter = value_types_by_name.find(name);
+    // If it already exists in input, check input and initializer is sync
+    // use shape info from input (input has priority over initializer)
+    if (iter != value_types_by_name.end()) {
+      checkShapesAndTypes(initializer_type, *iter->second);
+      // CheckTensorShapesAndTypes(*initializer_tensor_type, *iter->second->mutable_tensor_type());
+    }
+    // Support IR>=4: some tensors can only exist in initializer and not in input
+    // So shape_inference should make use of initializer shapes
+    // Store initializer shape info in value_info as well
+    else if (ir_version >= 4) {
+      initializer_type_list.push_back(std::move(initializer_type));
+      value_types_by_name[name] = &initializer_type_list.back();
+    }
+  }
+
+  void Process(GraphProto& graph) {
+    if (symbol_table) {
+      TraverseGraphsToAddExistingSymbols(graph, *symbol_table);
+    }
+    for (auto& vi : *graph.mutable_value_info()) {
+      UpdateType(vi);
+    }
+    for (auto& vi : *graph.mutable_input()) {
+      UpdateType(vi);
+    }
+    for (auto& vi : *graph.mutable_output()) {
+      UpdateType(vi);
+    }
+    for (const auto& tp : graph.initializer()) {
+      TypeProto initializer_type;
+      TypeProto_Tensor* initializer_tensor_type = initializer_type.mutable_tensor_type();
+      initializer_tensor_type->set_elem_type(tp.data_type());
+      // set the shape according to the initializer shape info
+      auto* shape = initializer_tensor_type->mutable_shape();
+      for (int i = 0; i < tp.dims_size(); ++i) {
+        shape->add_dim()->set_dim_value(tp.dims(i));
+      }
+      ProcessInitializer(tp.name(), tp, initializer_type, input_data_by_name);
+    }
+    for (const auto& tp : graph.sparse_initializer()) {
+      TypeProto initializer_type;
+      auto* initializer_sparse_tensor_type = initializer_type.mutable_sparse_tensor_type();
+      initializer_sparse_tensor_type->set_elem_type(tp.values().data_type());
+      // set the shape according to the initializer shape info
+      auto* shape = initializer_sparse_tensor_type->mutable_shape();
+      for (int i = 0; i < tp.dims_size(); ++i) {
+        shape->add_dim()->set_dim_value(tp.dims(i));
+      }
+      ProcessInitializer(tp.values().name(), tp, initializer_type, input_sparse_data_by_name);
+    }
+    for (auto& n : *graph.mutable_node()) {
+      Process(n);
+    }
+  }
+
+  void Process(const NodeProto& n, internal::AttributeBinder& attribute_binder) {
+    NodeProto copy_n(n);
+    attribute_binder.VisitNode(&copy_n);
+    Process(copy_n);
+  }
+
+  void Process(const FunctionProto& func_proto, InferenceContext& ctx) {
+    // Ensure Constant node tensor-attributes are copied
+    bool old_reuse_constant_tensors = reuse_constant_tensors;
+    reuse_constant_tensors = false;
+
+    // Get a temporary tensor-shape map
+    const int num_actual_inputs = static_cast<int>(ctx.getNumInputs());
+    const auto num_func_inputs = func_proto.input_size();
+    std::vector<TypeProto> types_cache(num_func_inputs);
+    for (int i = 0; i < num_func_inputs; ++i) {
+      auto& parameter_name = func_proto.input().Get(i);
+      auto* type_ptr = (i < num_actual_inputs) ? ctx.getInputType(i) : nullptr;
+      // nullptr is valid, and indicates a missing optional input
+      if (type_ptr != nullptr) {
+        // Use a temporary copy of original type.
+        // TODO: investigate whether we can eliminate use of temporary copy
+        types_cache[i] = *type_ptr;
+        value_types_by_name[parameter_name] = &types_cache[i];
+      } else
+        value_types_by_name[parameter_name] = nullptr;
+    }
+
+    // Create a temporary initializer value map
+    for (int i = 0; i < num_actual_inputs && i < num_func_inputs; ++i) {
+      const TypeProto* type = ctx.getInputType(i);
+      if (type != nullptr) {
+        if (type->value_case() == TypeProto::kTensorType && ctx.getInputData(i) != nullptr) {
+          input_data_by_name[func_proto.input().Get(i)] = ctx.getInputData(i);
+        } else if (type->value_case() == TypeProto::kSparseTensorType && ctx.getInputSparseData(i) != nullptr) {
+          input_sparse_data_by_name[func_proto.input().Get(i)] = ctx.getInputSparseData(i);
+        }
+      }
+    }
+
+    std::unordered_map<std::string, const AttributeProto*> attr_map;
+    for (auto& attr : func_proto.attribute()) {
+      if (ctx.getAttribute(attr) != nullptr) {
+        attr_map[attr] = ctx.getAttribute(attr);
+      }
+    }
+
+    for (auto& default_value : func_proto.attribute_proto()) {
+      const std::string& name = default_value.name();
+      const AttributeProto* value = ctx.getAttribute(name);
+      attr_map[name] = (value != nullptr) ? value : &default_value;
+    }
+
+    internal::AttributeBinder attribute_binder(attr_map);
+    for (auto& n : func_proto.node()) {
+      Process(n, attribute_binder);
+    }
+
+    for (int i = 0; i < func_proto.output_size(); ++i) {
+      const std::string& output_name = func_proto.output().Get(i);
+      // Skip if no type inferred for the tensor
+      auto iter = value_types_by_name.find(output_name);
+      if (iter != value_types_by_name.cend()) {
+        // Copy the type info to ctx
+        // to pass back to main graph
+        auto type_proto = ctx.getOutputType(i);
+        type_proto->CopyFrom(*(iter->second));
+      }
+    }
+
+    reuse_constant_tensors = old_reuse_constant_tensors;
+  }
+
+ public:
+  ShapeInferenceImplBase(
+      GraphProto* graph, // nullptr for FunctionProto inference
+      const std::unordered_map<std::string, TypeProto*>& outer_scope_value_types_by_name_in,
+      const std::unordered_map<std::string, int>& opset_imports_in,
+      const ShapeInferenceOptions& options_in,
+      SymbolTable* symbol_table_in,
+      const ModelLocalFunctionsMap& model_local_functions_map_in,
+      const ISchemaRegistry* schema_registry_in = OpSchemaRegistry::Instance(),
+      DataValueMap* generated_shape_data_by_name_in = nullptr,
+      const int ir_version_in = IR_VERSION // default the latest one
+      )
+      : inferred_types(graph),
+        value_types_by_name(outer_scope_value_types_by_name_in),
+        opset_imports(opset_imports_in),
+        options(options_in),
+        symbol_table(symbol_table_in),
+        model_local_functions_map(model_local_functions_map_in),
+        schema_registry(schema_registry_in),
+        generated_shape_data_by_name(generated_shape_data_by_name_in),
+        ir_version(ir_version_in),
+        graph_inference_context{
+            value_types_by_name,
+            opset_imports,
+            symbol_table,
+            model_local_functions_map,
+            schema_registry,
+            generated_shape_data_by_name,
+            ir_version} {
+    if (options.enable_data_propagation && generated_shape_data_by_name == nullptr) {
+      fail_shape_inference(
+          "Container for generated shape data cannot be nullptr when enable_data_propagation option is set.");
+    }
+  }
+
+  void FinalizeShapeInference() {
+    auto& errors = getErrors();
+    // Throw shape inference error if any. Error mode right now only supports 0 and 1.
+    // When set to 0, any node level shape inference errors are not thrown. This is to support backward compatiblity
+    // with 1.7 and earlier releases. When set to 1 it will throw all exceptions.
+    // TODO: Add a more granular way for exception handling.
+    if (!errors.empty() && options.error_mode > 0) {
+      std::string full_errors = "Inference error(s): ";
+      for (const std::string& error : inference_errors) {
+        full_errors += error + "\n";
+      }
+      fail_shape_inference(full_errors);
+    }
+  }
+
+  const std::vector<std::string>& getErrors() const {
+    return inference_errors;
+  }
+
+ private:
+  InferredTypes inferred_types;
+  std::unordered_map<std::string, TypeProto*> value_types_by_name;
+  const std::unordered_map<std::string, int>& opset_imports;
+
+  const ShapeInferenceOptions& options;
+  SymbolTable* symbol_table;
+  const ModelLocalFunctionsMap& model_local_functions_map;
+  const ISchemaRegistry* schema_registry;
+  DataValueMap* generated_shape_data_by_name;
+  int ir_version;
+  GraphInferenceContext graph_inference_context;
+
+  std::unordered_map<std::string, TypeProto*> undefined_value_types_by_name;
+  std::unordered_map<std::string, const TensorProto*> input_data_by_name;
+  std::unordered_map<std::string, TensorProto> input_data_by_name_holder;
+  std::unordered_map<std::string, const SparseTensorProto*> input_sparse_data_by_name;
+
+  bool has_unsupported_op = false;
+
+  std::vector<std::string> inference_errors;
+
+  std::list<TypeProto> initializer_type_list;
+
+  // reuse_constant_tensors: controls whether we need to copy tensors occurring as attributes
+  // in Constant nodes. We avoid it for inference for graphs, but must make a copy for functions.
+  bool reuse_constant_tensors = true;
+};
+
+}
+```
+
+
+
 
